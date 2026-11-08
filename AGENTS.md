@@ -4,8 +4,9 @@ These instructions apply to the entire repository.
 
 ## Mission
 
-Build a minimal, immutable Soroban helper that lets the current owner of one
-bound BLNT V3 backstop-manager atomically:
+Build a minimal, immutable Soroban helper that lets one independently
+configured owner operate a bound BLNT V3 backstop-manager atomically, subject
+to the manager's own authorization rules:
 
 - join the canonical BLNT:XLM and BLNT:USDC Comet V1.1 pools and deposit the
   resulting LP shares into the configured FirstLoss and SecondLoss tiers; and
@@ -32,17 +33,23 @@ conflict. Do not silently invent new economic policy.
 - The helper MUST hold no user funds or backstop positions after a successful
   operation.
 - The helper MUST NOT own, manage, upgrade, or recover the backstop-manager.
-- Every mutating entrypoint MUST require authorization from the
-  backstop-manager's current owner and pass that same address to the manager.
+- Every mutating entrypoint MUST require authorization from the helper's
+  immutable configured owner and pass that same address to the manager. The
+  manager remains solely responsible for accepting or rejecting that address
+  under its own owner and scoped-manager rules.
 - `deposit(first_blnt, second_blnt)` MUST treat its arguments as independent
   BLNT budgets for the configured FirstLoss and SecondLoss Comet joins.
 - Both Comet joins and both backstop deposits MUST succeed or roll back
   atomically. No newly minted LP shares may remain liquid in the manager after
   success.
-- `claim(first_min_lp_out, second_min_lp_out)` MUST accept one optional minimum
-  per tier, claim exactly the selected tiers, and roll all selected claims back
-  atomically if any selected claim fails.
-- The constructor MUST bind one manager, backstop, pool, BLNT:XLM LP,
+- `claim(first_min_lp_out, second_min_lp_out)` MUST require one minimum per
+  tier, claim both tiers, and roll both claims back atomically if either claim
+  fails.
+- `deposit_and_claim()` MUST accept no arguments, exclude manager-harvestable
+  BLNT from the available balance, split the remaining BLNT equally across the
+  two tiers, execute deposit before claim, and roll the entire call tree back
+  if any step fails.
+- The constructor MUST bind one owner, manager, backstop, pool, BLNT:XLM LP,
   BLNT:USDC LP, BLNT, XLM, and USDC configuration and validate the complete
   relationship before storing it.
 - The helper MUST reproduce Comet V1.1 proportional-join rounding and enforce
@@ -62,9 +69,9 @@ For contract changes:
 1. Update `docs/SYSTEM_SPEC.md` first when behavior changes.
 2. Add or update focused native tests.
 3. Test authorization, configuration substitution, token ordering, rounding,
-   zero and boundary inputs, single-tier and two-tier claims, insufficient
-   balances, slippage, partial-route failures, balance reconciliation, and
-   atomic rollback.
+   zero and boundary inputs, two-tier claims, combined-operation splitting,
+   harvestable-balance exclusion, insufficient balances, slippage,
+   partial-route failures, balance reconciliation, and atomic rollback.
 4. Build optimized `wasm32v1-none` WASM with Rust 1.91.1 and Soroban SDK
    27.0.3.
 5. Verify `source_repo=github:BLNT-Protocol/blnt-backstop-manager-helper`
