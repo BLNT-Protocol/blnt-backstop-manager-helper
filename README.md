@@ -25,4 +25,8 @@ authorization boundary.
 
 The normative design is in [`docs/SYSTEM_SPEC.md`](docs/SYSTEM_SPEC.md).
 
-No production deployment is authorized or recorded yet.
+Production deployments must use the exact optimized WASM published and
+attested by a tagged GitHub release. A deployment is not complete until its
+constructor bindings, on-chain bytes, source metadata, and explorer source
+linkage have been independently verified and recorded by the deployment
+orchestration repository.

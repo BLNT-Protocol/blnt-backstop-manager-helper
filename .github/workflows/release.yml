@@ -1,0 +1,21 @@
+name: Stellar Expert WASM Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  id-token: write
+  contents: write
+  attestations: write
+
+jobs:
+  release-contract:
+    uses: stellar-expert/soroban-build-workflow/.github/workflows/release.yml@88068ec50cba931a96436869727ed08edeb76ade
+    with:
+      release_name: ${{ github.ref_name }}
+      release_description: 'BLNT Backstop Manager Helper Release'
+    secrets:
+      release_token: ${{ secrets.GITHUB_TOKEN }}

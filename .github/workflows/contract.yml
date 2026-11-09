@@ -1,0 +1,22 @@
+name: contract
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install 1.91.1 --profile minimal --component clippy --component rustfmt --target wasm32v1-none
+      - uses: stellar/stellar-cli@5a7c5fe76530bf4248477ac812fc757146b98cc4 # v27.0.0
+        with:
+          version: 27.0.0
+      - run: make test
+      - run: make build
