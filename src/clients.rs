@@ -8,15 +8,7 @@ pub trait Manager {
     fn harvestable(e: Env, token: Address) -> i128;
     fn backstops(e: Env) -> Vec<Address>;
     fn pools(e: Env) -> Vec<Address>;
-    fn c_join_pool(
-        e: Env,
-        from: Address,
-        backstop: Address,
-        tier: BackstopTier,
-        pool_address: Address,
-        pool_amount_out: i128,
-        max_amounts_in: Vec<i128>,
-    );
+    fn transfer_token(e: Env, token: Address, to: Address, amount: i128);
     fn b_deposit(
         e: Env,
         from: Address,
@@ -44,7 +36,16 @@ pub trait Backstop {
 #[allow(dead_code)]
 #[contractclient(name = "CometClient")]
 pub trait Comet {
+    fn dep_tokn_amt_in_get_lp_tokns_out(
+        e: Env,
+        token_in: Address,
+        token_amount_in: i128,
+        min_pool_amount_out: i128,
+        user: Address,
+    ) -> i128;
     fn get_balance(e: Env, token: Address) -> i128;
+    fn get_normalized_weight(e: Env, token: Address) -> i128;
+    fn get_swap_fee(e: Env) -> i128;
     fn get_total_supply(e: Env) -> i128;
     fn get_tokens(e: Env) -> Vec<Address>;
 }

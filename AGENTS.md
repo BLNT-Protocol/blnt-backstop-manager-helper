@@ -8,8 +8,9 @@ Build a minimal, immutable Soroban helper that lets one independently
 configured owner operate a bound BLNT V3 backstop-manager atomically, subject
 to the manager's own authorization rules:
 
-- join the canonical BLNT:XLM and BLNT:USDC Comet V1.1 pools and deposit the
-  resulting LP shares into the configured FirstLoss and SecondLoss tiers; and
+- make BLNT-only deposits into the canonical BLNT:XLM and BLNT:USDC Comet
+  V1.1 pools and deposit the resulting LP shares into the configured FirstLoss
+  and SecondLoss tiers; and
 - claim emissions from both configured tiers.
 
 This repository is financial smart-contract software. Prefer explicit
@@ -38,10 +39,14 @@ conflict. Do not silently invent new economic policy.
   manager remains solely responsible for accepting or rejecting that address
   under its own owner and scoped-manager rules.
 - `deposit(first_blnt, second_blnt)` MUST treat its arguments as independent
-  BLNT budgets for the configured FirstLoss and SecondLoss Comet joins.
-- Both Comet joins and both backstop deposits MUST succeed or roll back
-  atomically. No newly minted LP shares may remain liquid in the manager after
-  success.
+  exact BLNT inputs for the configured FirstLoss and SecondLoss single-sided
+  Comet deposits.
+- Deposits MUST exclude manager-harvestable BLNT and require the helper owner
+  to remain the manager owner because the route uses the manager's owner-only
+  token transfer.
+- Both Comet deposits and both backstop deposits MUST succeed or roll back
+  atomically. No operation BLNT or newly minted LP shares may remain liquid in
+  the helper or manager after success.
 - `claim(first_min_lp_out, second_min_lp_out)` MUST require one minimum per
   tier, claim both tiers, and roll both claims back atomically if either claim
   fails.
@@ -52,8 +57,8 @@ conflict. Do not silently invent new economic policy.
 - The constructor MUST bind one owner, manager, backstop, pool, BLNT:XLM LP,
   BLNT:USDC LP, BLNT, XLM, and USDC configuration and validate the complete
   relationship before storing it.
-- The helper MUST reproduce Comet V1.1 proportional-join rounding and enforce
-  the system specification's fixed counterasset ceiling.
+- The helper MUST derive the system specification's conservative minimum LP
+  output from live Comet V1.1 state and consume no counterasset.
 - Never use floating-point arithmetic. Use checked integer arithmetic and
   explicit fixed-point scales.
 - Never disable release overflow checks.
@@ -70,7 +75,7 @@ For contract changes:
 2. Add or update focused native tests.
 3. Test authorization, configuration substitution, token ordering, rounding,
    zero and boundary inputs, two-tier claims, combined-operation splitting,
-   harvestable-balance exclusion, insufficient balances, slippage,
+   harvestable-balance exclusion, insufficient balances, single-sided minimums,
    partial-route failures, balance reconciliation, and atomic rollback.
 4. Build optimized `wasm32v1-none` WASM with Rust 1.91.1 and Soroban SDK
    27.0.3.

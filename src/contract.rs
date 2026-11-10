@@ -7,23 +7,18 @@ use crate::{
     HelperError,
 };
 use soroban_sdk::{
-    contract, contractimpl, panic_with_error, token::TokenClient, Address, Env, Executable, Vec,
-    I256,
+    auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
+    contract, contractimpl, panic_with_error,
+    token::TokenClient,
+    vec, Address, Env, Executable, IntoVal, Symbol, Vec, I256,
 };
 
-const COMET_SCALE: i128 = 1_000_000_000_000_000_000;
 const BPS_SCALE: i128 = 10_000;
-const PAIRED_SLIPPAGE_BPS: i128 = 100;
+const OUTPUT_MARGIN_BPS: i128 = 100;
+const STROOP: i128 = 10_000_000;
 
 #[contract]
 pub struct BlntBackstopManagerHelper;
-
-struct JoinQuote {
-    blnt: i128,
-    lp: i128,
-    max_pair: i128,
-    pair: i128,
-}
 
 fn checked_add(e: &Env, left: i128, right: i128) -> i128 {
     left.checked_add(right)
@@ -42,25 +37,6 @@ fn mul_div_floor(e: &Env, value: i128, numerator: i128, denominator: i128) -> i1
     I256::from_i128(e, value)
         .mul(&I256::from_i128(e, numerator))
         .div(&I256::from_i128(e, denominator))
-        .to_i128()
-        .unwrap_or_else(|| panic_with_error!(e, HelperError::Overflow))
-}
-
-fn mul_div_ceil(e: &Env, value: i128, numerator: i128, denominator: i128) -> i128 {
-    if value < 0 || numerator < 0 || denominator <= 0 {
-        panic_with_error!(e, HelperError::InvalidState);
-    }
-    let product = I256::from_i128(e, value).mul(&I256::from_i128(e, numerator));
-    let divisor = I256::from_i128(e, denominator);
-    let quotient = product.div(&divisor);
-    let rounded = if product.rem_euclid(&divisor) == I256::from_i32(e, 0) {
-        quotient
-    } else {
-        quotient
-            .checked_add(&I256::from_i32(e, 1))
-            .unwrap_or_else(|| panic_with_error!(e, HelperError::Overflow))
-    };
-    rounded
         .to_i128()
         .unwrap_or_else(|| panic_with_error!(e, HelperError::Overflow))
 }
@@ -102,87 +78,116 @@ fn configured_owner(config: &Config) -> Address {
     owner
 }
 
-fn quote_join(
-    e: &Env,
-    config: &Config,
-    lp: &Address,
-    paired: &Address,
-    blnt_budget: i128,
-) -> JoinQuote {
-    if blnt_budget <= 0 {
+fn minimum_single_sided_lp(e: &Env, config: &Config, lp: &Address, blnt_in: i128) -> i128 {
+    if blnt_in <= 0 {
         panic_with_error!(e, HelperError::InvalidAmount);
     }
     let comet = CometClient::new(e, lp);
     let supply = comet.get_total_supply();
     let blnt_reserve = comet.get_balance(&config.blnt);
-    let pair_reserve = comet.get_balance(paired);
-    if supply <= 0 || blnt_reserve <= 0 || pair_reserve <= 0 {
+    let weight = comet.get_normalized_weight(&config.blnt);
+    let fee = comet.get_swap_fee();
+    if supply <= 0
+        || blnt_reserve <= 0
+        || weight <= 0
+        || weight >= STROOP
+        || !(0..STROOP).contains(&fee)
+    {
         panic_with_error!(e, HelperError::InvalidState);
     }
 
-    let max_ratio = mul_div_floor(e, blnt_budget, COMET_SCALE, blnt_reserve);
-    let lp = mul_div_floor(e, max_ratio, supply, COMET_SCALE);
-    if lp <= 0 {
+    // For 0 < weight < 1 and x >= 0:
+    // (1 + x)^weight - 1 >= weight * x / (1 + x).
+    // Use that lower bound after Comet's taxable-balance fee adjustment, then
+    // apply a fixed 1% margin for integer approximation differences.
+    let taxable_fee = mul_div_floor(e, STROOP - weight, fee, STROOP);
+    let after_fee = mul_div_floor(e, blnt_in, STROOP - taxable_fee, STROOP);
+    let weighted_in = mul_div_floor(e, after_fee, weight, STROOP);
+    let denominator = checked_add(e, blnt_reserve, after_fee);
+    let lower_bound = mul_div_floor(e, supply, weighted_in, denominator);
+    let minimum = mul_div_floor(e, lower_bound, BPS_SCALE - OUTPUT_MARGIN_BPS, BPS_SCALE);
+    if minimum <= 0 {
         panic_with_error!(e, HelperError::InvalidAmount);
     }
-    let join_ratio = mul_div_ceil(e, lp, COMET_SCALE, supply);
-    let blnt = mul_div_ceil(e, blnt_reserve, join_ratio, COMET_SCALE);
-    let pair = mul_div_ceil(e, pair_reserve, join_ratio, COMET_SCALE);
-    if blnt <= 0 || blnt > blnt_budget || pair <= 0 {
-        panic_with_error!(e, HelperError::InvalidState);
-    }
-    let max_pair = mul_div_ceil(e, pair, BPS_SCALE + PAIRED_SLIPPAGE_BPS, BPS_SCALE);
-    JoinQuote {
-        blnt,
-        lp,
-        max_pair,
-        pair,
-    }
+    minimum
 }
 
-fn join_and_deposit(
+fn single_sided_deposit_and_deposit(
     e: &Env,
     config: &Config,
     owner: &Address,
     tier: BackstopTier,
     lp: &Address,
-    blnt_first: bool,
-    quote: &JoinQuote,
+    blnt_in: i128,
+    min_lp_out: i128,
 ) -> TierDepositResult {
-    let mut max_amounts = Vec::new(e);
-    if blnt_first {
-        max_amounts.push_back(quote.blnt);
-        max_amounts.push_back(quote.max_pair);
-    } else {
-        max_amounts.push_back(quote.max_pair);
-        max_amounts.push_back(quote.blnt);
-    }
-
     let manager = ManagerClient::new(e, &config.manager);
+    let helper = e.current_contract_address();
+    let blnt = TokenClient::new(e, &config.blnt);
     let lp_token = TokenClient::new(e, lp);
-    let lp_before = lp_token.balance(&config.manager);
-    manager.c_join_pool(
-        owner,
-        &config.backstop,
-        &tier,
-        &config.pool,
-        &quote.lp,
-        &max_amounts,
-    );
-    if lp_token.balance(&config.manager).checked_sub(lp_before) != Some(quote.lp) {
+    let manager_blnt_before = blnt.balance(&config.manager);
+    let helper_blnt_before = blnt.balance(&helper);
+    let manager_lp_before = lp_token.balance(&config.manager);
+    let helper_lp_before = lp_token.balance(&helper);
+    manager.transfer_token(&config.blnt, &helper, &blnt_in);
+    if manager_blnt_before.checked_sub(blnt.balance(&config.manager)) != Some(blnt_in)
+        || blnt.balance(&helper).checked_sub(helper_blnt_before) != Some(blnt_in)
+    {
         panic_with_error!(e, HelperError::BalanceMismatch);
     }
+
+    let approval_ledger = (e.ledger().sequence() / 100_000 + 1) * 100_000;
+    e.authorize_as_current_contract(vec![
+        e,
+        InvokerContractAuthEntry::Contract(SubContractInvocation {
+            context: ContractContext {
+                contract: config.blnt.clone(),
+                fn_name: Symbol::new(e, "approve"),
+                args: vec![
+                    e,
+                    helper.clone().into_val(e),
+                    lp.clone().into_val(e),
+                    blnt_in.into_val(e),
+                    approval_ledger.into_val(e),
+                ],
+            },
+            sub_invocations: vec![e],
+        }),
+    ]);
+    let lp_minted = CometClient::new(e, lp).dep_tokn_amt_in_get_lp_tokns_out(
+        &config.blnt,
+        &blnt_in,
+        &min_lp_out,
+        &helper,
+    );
+    if lp_minted < min_lp_out
+        || blnt.balance(&helper) != helper_blnt_before
+        || lp_token.balance(&helper).checked_sub(helper_lp_before) != Some(lp_minted)
+    {
+        panic_with_error!(e, HelperError::BalanceMismatch);
+    }
+
+    lp_token.transfer(&helper, &config.manager, &lp_minted);
+    if lp_token.balance(&helper) != helper_lp_before
+        || lp_token
+            .balance(&config.manager)
+            .checked_sub(manager_lp_before)
+            != Some(lp_minted)
+    {
+        panic_with_error!(e, HelperError::BalanceMismatch);
+    }
+
     let backstop_shares =
-        manager.b_deposit(owner, &config.backstop, &tier, &config.pool, &quote.lp);
-    if backstop_shares <= 0 || lp_token.balance(&config.manager) != lp_before {
+        manager.b_deposit(owner, &config.backstop, &tier, &config.pool, &lp_minted);
+    if backstop_shares <= 0 || lp_token.balance(&config.manager) != manager_lp_before {
         panic_with_error!(e, HelperError::BalanceMismatch);
     }
 
     TierDepositResult {
         backstop_shares,
-        blnt_in: quote.blnt,
-        lp_minted: quote.lp,
-        paired_in: quote.pair,
+        blnt_in,
+        lp_minted,
+        paired_in: 0,
     }
 }
 
@@ -193,44 +198,50 @@ fn execute_deposit(
     first_blnt: i128,
     second_blnt: i128,
 ) -> DepositResult {
-    let first_quote = quote_join(e, config, &config.first_lp, &config.xlm, first_blnt);
-    let second_quote = quote_join(e, config, &config.second_lp, &config.usdc, second_blnt);
+    if first_blnt <= 0 || second_blnt <= 0 {
+        panic_with_error!(e, HelperError::InvalidAmount);
+    }
     let blnt = TokenClient::new(e, &config.blnt);
     let xlm = TokenClient::new(e, &config.xlm);
     let usdc = TokenClient::new(e, &config.usdc);
     let blnt_before = blnt.balance(&config.manager);
     let xlm_before = xlm.balance(&config.manager);
     let usdc_before = usdc.balance(&config.manager);
-    let blnt_required = checked_add(e, first_quote.blnt, second_quote.blnt);
-    if blnt_before < blnt_required
-        || xlm_before < first_quote.pair
-        || usdc_before < second_quote.pair
+    let harvestable = ManagerClient::new(e, &config.manager).harvestable(&config.blnt);
+    let blnt_required = checked_add(e, first_blnt, second_blnt);
+    if harvestable < 0
+        || harvestable > blnt_before
+        || checked_sub(e, blnt_before, harvestable) < blnt_required
     {
         panic_with_error!(e, HelperError::InsufficientBalance);
     }
+    // Derive both execution bounds before the first external mutation so an
+    // invalid second route cannot begin the first route.
+    let first_min_lp_out = minimum_single_sided_lp(e, config, &config.first_lp, first_blnt);
+    let second_min_lp_out = minimum_single_sided_lp(e, config, &config.second_lp, second_blnt);
 
-    let first = join_and_deposit(
+    let first = single_sided_deposit_and_deposit(
         e,
         config,
         owner,
         BackstopTier::FirstLoss,
         &config.first_lp,
-        config.first_blnt_first,
-        &first_quote,
+        first_blnt,
+        first_min_lp_out,
     );
-    let second = join_and_deposit(
+    let second = single_sided_deposit_and_deposit(
         e,
         config,
         owner,
         BackstopTier::SecondLoss,
         &config.second_lp,
-        config.second_blnt_first,
-        &second_quote,
+        second_blnt,
+        second_min_lp_out,
     );
 
     if blnt_before.checked_sub(blnt.balance(&config.manager)) != Some(blnt_required)
-        || xlm_before.checked_sub(xlm.balance(&config.manager)) != Some(first_quote.pair)
-        || usdc_before.checked_sub(usdc.balance(&config.manager)) != Some(second_quote.pair)
+        || xlm.balance(&config.manager) != xlm_before
+        || usdc.balance(&config.manager) != usdc_before
     {
         panic_with_error!(e, HelperError::BalanceMismatch);
     }
